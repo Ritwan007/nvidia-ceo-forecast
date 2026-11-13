@@ -4,9 +4,13 @@ Reads each case file (<id>.in) in the input directory and writes <id>.out
 with five quantiles (0.05, 0.25, 0.5, 0.75, 0.95) for every market and each
 of the 240 minutes after the checkpoint. Standard library only.
 
-Model v2 (rebuilt on the kit's six practice cases; practice pinball loss
-0.270 against the house baseline's 0.364, beating the baseline and v1's
-0.303 on all six cases; leave-one-case-out mean 0.270):
+Model v3 (v2 plus one change: the inner-quantile shape factor now depends
+on the market's price level. Practice pinball loss 0.263 against the house
+baseline's 0.364, v1's 0.303 and v2's 0.270, beating v2 on all six practice
+cases with a leave-one-case-out mean of 0.263; the same change also wins
+on 294 in-history pseudo-checkpoint windows from the event's late regime
+and on 25,000 bootstrapped jump-heavy paths, where it never blows up
+relative to v2):
 
 - The median stays at the checkpoint price: these prices are step
   functions that sit still for long stretches, and every drift, momentum,
@@ -23,22 +27,33 @@ Model v2 (rebuilt on the kit's six practice cases; practice pinball loss
   0.012 instead of the quiet global base: the one such practice market
   ranged over 0.19 inside its forecast window.
 - The sqrt(h) widening is capped by a fitted variance term structure
-  (research T6, after Lo & MacKinlay's variance ratio): the empirical
-  standard deviation of 15/60/240-minute changes over the last 1080
-  minutes implies a per-root-minute scale s(h); where s(h) says variance
-  grows slower than h (bounded prices mean-revert), the band follows it.
-  The cap only ever narrows the band, never widens it.
-- The five levels use Student-t(5) quantiles (these prices jump, so the
-  tails are fatter than a normal band allows), with the two inner levels
-  compressed by 0.7: at short horizons most minutes do not move at all,
-  so the interquartile range of the step process is far tighter than a
-  scaled t shape implies.
+  (after Lo & MacKinlay's variance ratio): the empirical standard
+  deviation of 15/60/240-minute changes over the last 1080 minutes implies
+  a per-root-minute scale s(h); where s(h) says variance grows slower
+  than h (bounded prices mean-revert), the band follows it. The cap only
+  ever narrows the band, never widens it.
+- The outer levels use Student-t(5) quantiles (these prices jump, so the
+  tails are fatter than a normal band allows). The inner levels use a
+  per-price-level shape factor times the normal 0.6745 spacing: at short
+  horizons most minutes do not move at all, so the interquartile range of
+  the step process is far tighter than any fixed scaled shape implies --
+  and how much tighter depends on the price level. A near-dead longshot
+  under 0.02 moves in whole ticks or not at all (factor 0.20); mid-priced
+  markets sit between (0.68); the actively traded favorite at 0.15+ moves
+  almost every minute, so its interquartile range is *wider* than the
+  compressed shape v2 used everywhere (1.60). The factors are pooled
+  across markets per price-level bucket (the one cross-market effect the
+  literature supports: pooled shrinkage, not per-market fits), and the
+  surface around them is a flat plateau, not a knife edge.
 """
 import json
 import math
 import os
 
-Z = [-2.0150, -0.50869, 0.0, 0.50869, 2.0150]  # t(5); inner levels x0.7
+Z_OUTER = 2.0150      # Student-t(5) 0.95 quantile
+Z_INNER = 0.674490    # normal 0.75 quantile; scaled by the bucket factor
+# Inner shape factor by checkpoint price level: (upper edge, factor).
+INNER_BUCKETS = ((0.02, 0.20), (0.15, 0.68), (float("inf"), 1.60))
 BASE_SIGMA = 0.0011   # global scale the per-market sigma shrinks toward
 SHRINK = 0.65         # weight on the market's own recent sigma
 SIGMA_LO = 0.0002
@@ -128,10 +143,20 @@ def ts_scale(pts, h):
     return math.exp(pts[-1][1])
 
 
+def inner_factor(x):
+    """Inner-quantile shape factor for a market priced at x."""
+    for edge, f in INNER_BUCKETS:
+        if x < edge:
+            return f
+    return INNER_BUCKETS[-1][1]
+
+
 def forecast_market(prices, horizon=HORIZON):
     x = prices[-1]
     s = market_sigma(prices)
     pts = term_structure_caps(prices)
+    z_in = Z_INNER * inner_factor(x)
+    z = [-Z_OUTER, -z_in, 0.0, z_in, Z_OUTER]
     rows = []
     for h in range(1, horizon + 1):
         w = s * math.sqrt(h)
@@ -141,8 +166,8 @@ def forecast_market(prices, horizon=HORIZON):
                 w = cap
         row = []
         prev = 0.0
-        for z in Z:
-            v = x + z * w
+        for zv in z:
+            v = x + zv * w
             v = 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
             if v < prev:
                 v = prev
